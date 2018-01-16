@@ -2,12 +2,11 @@ package offspring
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
-
-	"encoding/json"
 
 	"github.com/rancher/norman/clientbase"
 	"github.com/rancher/norman/types/values"
@@ -245,7 +244,7 @@ func (w *Reconciliation) Changed(key string, obj runtime.Object) (runtime.Object
 		objectSet ObjectSet
 	)
 
-	if obj == nil {
+	if obj == nil || reflect.ValueOf(obj).IsNil() {
 		objectSet.Complete = true
 	} else {
 		objectSet, err = w.Generator(obj)
