@@ -24,7 +24,6 @@ import (
 
 const (
 	WorkloadAnnotation    = "field.cattle.io/targetWorkloadIds"
-	ProjectIDAnnotation   = "field.cattle.io/projectId"
 	WorkloadIDLabelPrefix = "workloadID"
 )
 
@@ -35,6 +34,7 @@ type Controller struct {
 	deploymentLister v1beta2.DeploymentLister
 	podLister        v1.PodLister
 	namespaceLister  v1.NamespaceLister
+	services         v1.ServiceInterface
 }
 
 func Register(ctx context.Context, workload *config.WorkloadContext) {
@@ -43,35 +43,32 @@ func Register(ctx context.Context, workload *config.WorkloadContext) {
 		deploymentLister: workload.Apps.Deployments("").Controller().Lister(),
 		podLister:        workload.Core.Pods("").Controller().Lister(),
 		namespaceLister:  workload.Core.Namespaces("").Controller().Lister(),
+		services:         workload.Core.Services(""),
 	}
-	workload.Core.Services("").AddLifecycle(c.GetName(), c)
+	workload.Core.Services("").AddHandler(c.GetName(), c.sync)
 }
 
 func (c *Controller) GetName() string {
 	return "workloadServiceController"
 }
 
-func (c *Controller) Remove(obj *corev1.Service) (*corev1.Service, error) {
-	// delete from the workload map
-	WorkloadServiceUUIDToDeploymentUUIDs.Delete(fmt.Sprintf("%s:%s", obj.Namespace, obj.Name))
-	return nil, nil
+func (c *Controller) sync(key string, obj *corev1.Service) error {
+	if obj == nil {
+		// delete from the workload map
+		WorkloadServiceUUIDToDeploymentUUIDs.Delete(key)
+		return nil
+	}
+
+	return c.reconcilePods(key, obj)
 }
 
-func (c *Controller) Create(obj *corev1.Service) (*corev1.Service, error) {
-	return c.reconcilePods(obj)
-}
-
-func (c *Controller) Updated(obj *corev1.Service) (*corev1.Service, error) {
-	return c.reconcilePods(obj)
-}
-
-func (c *Controller) reconcilePods(obj *corev1.Service) (*corev1.Service, error) {
+func (c *Controller) reconcilePods(key string, obj *corev1.Service) error {
 	if obj.Annotations == nil {
-		return nil, nil
+		return nil
 	}
 	value, ok := obj.Annotations[WorkloadAnnotation]
 	if !ok {
-		return nil, nil
+		return nil
 	}
 	workdloadIDs := strings.Split(value, ",")
 
@@ -79,21 +76,24 @@ func (c *Controller) reconcilePods(obj *corev1.Service) (*corev1.Service, error)
 		obj.Spec.Selector = make(map[string]string)
 	}
 	selectorToAdd := getServiceSelector(obj)
-	update := false
+	var toUpdate *corev1.Service
 	if _, ok := obj.Spec.Selector[selectorToAdd]; !ok {
-		update = true
-		obj.Spec.Selector[selectorToAdd] = "true"
+		toUpdate = obj.DeepCopy()
+		toUpdate.Spec.Selector[selectorToAdd] = "true"
 	}
-	if err := c.updatePods(obj, workdloadIDs); err != nil {
-		return nil, err
+	if err := c.updatePods(key, obj, workdloadIDs); err != nil {
+		return err
 	}
-	if update {
-		return obj, nil
+	if toUpdate != nil {
+		_, err := c.services.Update(toUpdate)
+		if err != nil {
+			return err
+		}
 	}
-	return nil, nil
+	return nil
 }
 
-func (c *Controller) updatePods(obj *corev1.Service, workloadIDs []string) error {
+func (c *Controller) updatePods(key string, obj *corev1.Service, workloadIDs []string) error {
 	// filter out project namespaces
 	namespaces, err := dnsrecord.GetProjectNamespaces(c.namespaceLister, obj)
 	if err != nil {
@@ -129,7 +129,7 @@ func (c *Controller) updatePods(obj *corev1.Service, workloadIDs []string) error
 		}
 
 		// Add workload/deployment to the system map
-		targetWorkloadUUID := fmt.Sprintf("%s:%s", targetWorkload.Namespace, targetWorkload.Name)
+		targetWorkloadUUID := fmt.Sprintf("%s/%s", targetWorkload.Namespace, targetWorkload.Name)
 		targetWorkloadUUIDs[targetWorkloadUUID] = true
 
 		// Find all the pods satisfying deployments' selectors
@@ -165,8 +165,7 @@ func (c *Controller) updatePods(obj *corev1.Service, workloadIDs []string) error
 			}
 		}
 	}
-	workloadServiceUUID := fmt.Sprintf("%s:%s", obj.Namespace, obj.Name)
-	WorkloadServiceUUIDToDeploymentUUIDs.Store(workloadServiceUUID, targetWorkloadUUIDs)
+	WorkloadServiceUUIDToDeploymentUUIDs.Store(key, targetWorkloadUUIDs)
 	return nil
 }
 

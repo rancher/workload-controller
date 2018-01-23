@@ -27,7 +27,7 @@ func Register(ctx context.Context, workload *config.WorkloadContext) {
 		serviceLister:    workload.Core.Services("").Controller().Lister(),
 		pods:             workload.Core.Pods(""),
 	}
-	workload.Core.Pods("").AddSyncHandler(c.sync)
+	workload.Core.Pods("").AddHandler(c.GetName(), c.sync)
 }
 
 func (c *Controller) sync(key string, obj *corev1.Pod) error {
@@ -44,7 +44,7 @@ func (c *Controller) sync(key string, obj *corev1.Pod) error {
 	for _, d := range deployments {
 		selector := labels.SelectorFromSet(d.Spec.Selector.MatchLabels)
 		if selector.Matches(labels.Set(obj.Labels)) {
-			deploymentUUID := fmt.Sprintf("%s:%s", d.Namespace, d.Name)
+			deploymentUUID := fmt.Sprintf("%s/%s", d.Namespace, d.Name)
 			workloadservice.WorkloadServiceUUIDToDeploymentUUIDs.Range(func(k, v interface{}) bool {
 				if _, ok := v.(map[string]bool)[deploymentUUID]; ok {
 					workloadServiceUUIDToAdd = append(workloadServiceUUIDToAdd, k.(string))
@@ -54,36 +54,27 @@ func (c *Controller) sync(key string, obj *corev1.Pod) error {
 		}
 	}
 
-	workLoadLabels := make(map[string]string)
+	workloadServicesLabels := make(map[string]string)
 	for _, workloadServiceUUID := range workloadServiceUUIDToAdd {
-		splitted := strings.Split(workloadServiceUUID, ":")
+		splitted := strings.Split(workloadServiceUUID, "/")
 		workload, err := c.serviceLister.Get(obj.Namespace, splitted[1])
 		if err != nil {
 			return err
 		}
 		for key, value := range workload.Spec.Selector {
-			workLoadLabels[key] = value
+			workloadServicesLabels[key] = value
 		}
 	}
-	if len(workLoadLabels) == 0 {
+	if len(workloadServicesLabels) == 0 {
 		return nil
 	}
-	labelsToAdd := make(map[string]string)
-	for key, value := range labelsToAdd {
-		if _, ok := obj.Labels[key]; ok {
-			continue
-		}
-		labelsToAdd[key] = value
+	toUpdate := obj.DeepCopy()
+	for key, value := range workloadServicesLabels {
+		toUpdate.Labels[key] = value
 	}
-	if len(labelsToAdd) > 0 {
-		toUpdate := obj.DeepCopy()
-		for key, value := range labelsToAdd {
-			toUpdate.Labels[key] = value
-		}
-		_, err := c.pods.Update(toUpdate)
-		if err != nil {
-			return err
-		}
+	_, err = c.pods.Update(toUpdate)
+	if err != nil {
+		return err
 	}
 
 	return nil

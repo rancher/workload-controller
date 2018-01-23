@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 
+	"sync"
+
 	"github.com/pkg/errors"
 	"github.com/rancher/types/apis/core/v1"
 	"github.com/rancher/types/config"
@@ -20,10 +22,11 @@ import (
 // that would be handled in the separate controller
 
 const (
-	DNSAnnotation         = "tfield.cattle.io/argetDNSRecordIds"
-	ProjectIDAnnotation   = "field.cattle.io/projectId"
-	DNSEndpointAnnotation = "DNSRecordServiceIds"
+	DNSAnnotation       = "field.cattle.io/targetDNSRecordIds"
+	ProjectIDAnnotation = "field.cattle.io/projectId"
 )
+
+var ServiceUUIDToTargetEndpointUUIDs sync.Map
 
 type Controller struct {
 	endpoints       v1.EndpointsInterface
@@ -37,7 +40,7 @@ func Register(ctx context.Context, workload *config.WorkloadContext) {
 		endpointLister:  workload.Core.Endpoints("").Controller().Lister(),
 		namespaceLister: workload.Core.Namespaces("").Controller().Lister(),
 	}
-	workload.Core.Services("").AddSyncHandler(c.sync)
+	workload.Core.Services("").AddHandler(c.GetName(), c.sync)
 }
 
 func (c *Controller) GetName() string {
@@ -47,9 +50,10 @@ func (c *Controller) GetName() string {
 func (c *Controller) sync(key string, obj *corev1.Service) error {
 	// no need to handle the remove
 	if obj == nil || obj.DeletionTimestamp != nil {
+		ServiceUUIDToTargetEndpointUUIDs.Delete(key)
 		return nil
 	}
-	return c.reconcileEndpoints(obj)
+	return c.reconcileEndpoints(key, obj)
 }
 
 func getNamespaceProjectID(ns *corev1.Namespace) string {
@@ -60,7 +64,7 @@ func getNamespaceProjectID(ns *corev1.Namespace) string {
 	return ""
 }
 
-func (c *Controller) reconcileEndpoints(obj *corev1.Service) error {
+func (c *Controller) reconcileEndpoints(key string, obj *corev1.Service) error {
 	// only process services having targetDNSRecordIds in annotation
 	if obj.Annotations == nil {
 		return nil
@@ -72,13 +76,12 @@ func (c *Controller) reconcileEndpoints(obj *corev1.Service) error {
 
 	records := strings.Split(value, ",")
 	var newEndpointSubsets []corev1.EndpointSubset
-
+	targetEndpointUUIDs := make(map[string]bool)
 	// filter out project namespaces
 	namespaces, err := GetProjectNamespaces(c.namespaceLister, obj)
 	if err != nil {
 		return err
 	}
-	selfNamespaceServiceAnnotation := fmt.Sprintf("%s:%s", obj.Namespace, obj.Name)
 	for _, record := range records {
 		groomed := strings.TrimSpace(record)
 		namespaceService := strings.Split(groomed, ":")
@@ -101,35 +104,10 @@ func (c *Controller) reconcileEndpoints(obj *corev1.Service) error {
 			continue
 		}
 		newEndpointSubsets = append(newEndpointSubsets, targetEndpoint.Subsets...)
-		// mark the endpoint with the label so it can be filtered out by endpoints controller
-		dnsAnnotationValue := ""
-		update := true
-		if val, ok := targetEndpoint.Annotations[DNSEndpointAnnotation]; ok {
-			splitted := strings.Split(val, ",")
-			for _, svc := range splitted {
-				if svc == selfNamespaceServiceAnnotation {
-					update = false
-					break
-				}
-			}
-			if update {
-				dnsAnnotationValue = fmt.Sprintf("%s,%s", val, selfNamespaceServiceAnnotation)
-			}
-		} else {
-			dnsAnnotationValue = selfNamespaceServiceAnnotation
-		}
-		if update {
-			if targetEndpoint.Annotations == nil {
-				targetEndpoint.Annotations = make(map[string]string)
-			}
-			toUpdate := targetEndpoint.DeepCopy()
-			toUpdate.Annotations[DNSEndpointAnnotation] = dnsAnnotationValue
-			_, err := c.endpoints.Update(toUpdate)
-			if err != nil {
-				return errors.Wrapf(err, "Failed to update target endpoint [%s] for dns record [%s", targetEndpoint.Name, groomed)
-			}
-		}
+		targetEndpointUUID := fmt.Sprintf("%s/%s", targetEndpoint.Namespace, targetEndpoint.Name)
+		targetEndpointUUIDs[targetEndpointUUID] = true
 	}
+	ServiceUUIDToTargetEndpointUUIDs.Store(key, targetEndpointUUIDs)
 
 	ep, err := c.endpointLister.Get(obj.Namespace, obj.Name)
 	if err != nil {
